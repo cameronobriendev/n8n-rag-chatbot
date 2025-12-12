@@ -1,0 +1,256 @@
+{
+  "name": "RAG Document Ingestion",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "rag-ingest",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [200, 300],
+      "id": "webhook-ingest",
+      "name": "Webhook - Document Upload",
+      "webhookId": "rag-ingest"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Validate input and generate document ID\nconst documentName = $input.first().json.body.name || 'Untitled Document';\nconst content = $input.first().json.body.content || '';\nconst sessionId = $input.first().json.body.sessionId || 'default';\n\nif (!content || content.trim().length === 0) {\n  throw new Error('Document content is required');\n}\n\nreturn [{\n  json: {\n    documentName,\n    content,\n    sessionId,\n    fileSize: content.length,\n    fileType: 'text/plain'\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [400, 300],
+      "id": "code-validate",
+      "name": "Validate Input"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO documents (name, file_type, file_size)\nVALUES ('{{ $json.documentName }}', '{{ $json.fileType }}', {{ $json.fileSize }})\nRETURNING id, name;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [600, 300],
+      "id": "postgres-create-doc",
+      "name": "Create Document Record",
+      "credentials": {
+        "postgres": {
+          "id": "AKemFf7TnrxslCJE",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Text Chunking - Ported from production RAG chatbot\n// Strategy: 500 tokens (~2000 chars) with 50 token overlap\n\nconst validateData = $('Validate Input').first().json;\nconst dbResult = $input.first().json;\n\nconst documentId = dbResult.id;\nconst documentName = dbResult.name;\nconst content = validateData.content;\n\nconst CHUNK_SIZE = 500;\nconst OVERLAP = 50;\nconst CHARS_PER_TOKEN = 4;\n\nconst chunkCharSize = CHUNK_SIZE * CHARS_PER_TOKEN;\nconst overlapCharSize = OVERLAP * CHARS_PER_TOKEN;\n\n// Clean text\nconst cleanedText = content\n  .replace(/\\r\\n/g, '\\n')\n  .replace(/\\n{3,}/g, '\\n\\n')\n  .replace(/\\x00/g, '')\n  .trim();\n\nif (cleanedText.length === 0) {\n  throw new Error('Document has no extractable text');\n}\n\n// Chunk the text\nconst chunks = [];\n\nif (cleanedText.length <= chunkCharSize) {\n  chunks.push(cleanedText);\n} else {\n  let start = 0;\n  \n  while (start < cleanedText.length) {\n    let end = start + chunkCharSize;\n    \n    if (end < cleanedText.length) {\n      const searchStart = Math.max(start, end - 200);\n      const searchText = cleanedText.slice(searchStart, Math.min(end + 200, cleanedText.length));\n      \n      const sentenceMatch = searchText.match(/[.!?]\\s/g);\n      \n      if (sentenceMatch) {\n        const lastMatch = searchText.lastIndexOf(sentenceMatch[sentenceMatch.length - 1]);\n        if (lastMatch !== -1) {\n          end = searchStart + lastMatch + 2;\n        }\n      } else {\n        const paragraphMatch = cleanedText.lastIndexOf('\\n\\n', end);\n        if (paragraphMatch > start) {\n          end = paragraphMatch + 2;\n        } else {\n          const spaceMatch = cleanedText.lastIndexOf(' ', end);\n          if (spaceMatch > start) {\n            end = spaceMatch + 1;\n          }\n        }\n      }\n    }\n    \n    const chunk = cleanedText.slice(start, end).trim();\n    if (chunk.length > 0) {\n      chunks.push(chunk);\n    }\n    \n    start = end - overlapCharSize;\n    if (start <= 0 || start >= cleanedText.length - 10) {\n      start = end;\n    }\n  }\n}\n\nreturn chunks.map((chunkContent, index) => ({\n  json: {\n    documentId,\n    documentName,\n    chunkIndex: index,\n    chunkContent,\n    totalChunks: chunks.length\n  }\n}));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [800, 300],
+      "id": "code-chunk",
+      "name": "Chunk Text"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/embeddings",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"text-embedding-3-small\",\n  \"input\": {{ JSON.stringify($json.chunkContent) }},\n  \"encoding_format\": \"float\"\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1000, 300],
+      "id": "http-embed",
+      "name": "OpenAI Embeddings",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "7qAmD2SPJNRp6TZm",
+          "name": "OpenAI API Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Prepare for Postgres insert\nconst chunkData = $('Chunk Text').item;\nconst embeddingResponse = $input.first().json;\n\nconst embedding = embeddingResponse.data[0].embedding;\n\n// Escape single quotes in content for SQL\nconst escapedContent = chunkData.json.chunkContent.replace(/'/g, \"''\");\n\nreturn [{\n  json: {\n    documentId: chunkData.json.documentId,\n    documentName: chunkData.json.documentName,\n    chunkIndex: chunkData.json.chunkIndex,\n    content: escapedContent,\n    embedding: JSON.stringify(embedding),\n    totalChunks: chunkData.json.totalChunks\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1200, 300],
+      "id": "code-prepare-insert",
+      "name": "Prepare Insert"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO chunks (document_id, content, chunk_index, embedding)\nVALUES (\n  {{ $json.documentId }},\n  '{{ $json.content }}',\n  {{ $json.chunkIndex }},\n  '{{ $json.embedding }}'\n)\nRETURNING id;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1400, 300],
+      "id": "postgres-insert-chunk",
+      "name": "Insert Chunk",
+      "credentials": {
+        "postgres": {
+          "id": "AKemFf7TnrxslCJE",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Aggregate results\nconst items = $input.all();\nconst firstChunk = $('Prepare Insert').first().json;\n\nreturn [{\n  json: {\n    success: true,\n    documentId: firstChunk.documentId,\n    documentName: firstChunk.documentName,\n    chunksProcessed: items.length,\n    message: `Ingested ${items.length} chunks from \"${firstChunk.documentName}\"`\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1600, 300],
+      "id": "code-aggregate",
+      "name": "Aggregate Results"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE documents SET chunk_count = {{ $json.chunksProcessed }} WHERE id = {{ $json.documentId }};",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1800, 300],
+      "id": "postgres-update-count",
+      "name": "Update Chunk Count",
+      "credentials": {
+        "postgres": {
+          "id": "AKemFf7TnrxslCJE",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $('Aggregate Results').first().json }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [2000, 300],
+      "id": "respond-success",
+      "name": "Respond Success"
+    }
+  ],
+  "connections": {
+    "Webhook - Document Upload": {
+      "main": [
+        [
+          {
+            "node": "Validate Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Input": {
+      "main": [
+        [
+          {
+            "node": "Create Document Record",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Document Record": {
+      "main": [
+        [
+          {
+            "node": "Chunk Text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Chunk Text": {
+      "main": [
+        [
+          {
+            "node": "OpenAI Embeddings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Embeddings": {
+      "main": [
+        [
+          {
+            "node": "Prepare Insert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Insert": {
+      "main": [
+        [
+          {
+            "node": "Insert Chunk",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert Chunk": {
+      "main": [
+        [
+          {
+            "node": "Aggregate Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Aggregate Results": {
+      "main": [
+        [
+          {
+            "node": "Update Chunk Count",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Chunk Count": {
+      "main": [
+        [
+          {
+            "node": "Respond Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "meta": {
+    "instanceId": "n8n-rag-chatbot"
+  },
+  "tags": []
+}

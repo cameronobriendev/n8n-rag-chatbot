@@ -1,0 +1,291 @@
+{
+  "name": "RAG Query",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "rag-query",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [200, 300],
+      "id": "webhook-query",
+      "name": "Webhook - Query",
+      "webhookId": "rag-query"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Validate and extract question\nconst body = $input.first().json.body || {};\nconst question = body.question || body.query || '';\nconst sessionId = body.sessionId || 'default';\n\nif (!question || question.trim().length === 0) {\n  throw new Error('Question is required');\n}\n\nreturn [{\n  json: {\n    question: question.trim(),\n    sessionId,\n    startTime: Date.now()\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [400, 300],
+      "id": "code-validate-query",
+      "name": "Validate Question"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/embeddings",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"text-embedding-3-small\",\n  \"input\": {{ JSON.stringify($json.question) }},\n  \"encoding_format\": \"float\"\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [600, 300],
+      "id": "http-embed-question",
+      "name": "Embed Question",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "7qAmD2SPJNRp6TZm",
+          "name": "OpenAI API Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Extract embedding for vector search\nconst questionData = $('Validate Question').first().json;\nconst embeddingResponse = $input.first().json;\n\nconst embedding = embeddingResponse.data[0].embedding;\n\nreturn [{\n  json: {\n    question: questionData.question,\n    sessionId: questionData.sessionId,\n    startTime: questionData.startTime,\n    embedding: JSON.stringify(embedding)\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [800, 300],
+      "id": "code-prepare-search",
+      "name": "Prepare Search"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  c.id,\n  c.content,\n  c.document_id,\n  d.name as document_name,\n  1 - (c.embedding <=> '{{ $json.embedding }}') as similarity\nFROM chunks c\nJOIN documents d ON c.document_id = d.id\nORDER BY c.embedding <=> '{{ $json.embedding }}'\nLIMIT 3;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1000, 300],
+      "id": "postgres-search",
+      "name": "Vector Search",
+      "credentials": {
+        "postgres": {
+          "id": "AKemFf7TnrxslCJE",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Format context from retrieved chunks\nconst questionData = $('Prepare Search').first().json;\nconst searchResults = $input.all().map(item => item.json);\n\nif (!searchResults || searchResults.length === 0 || !searchResults[0].content) {\n  return [{\n    json: {\n      question: questionData.question,\n      hasResults: false,\n      context: '',\n      sources: [],\n      startTime: questionData.startTime\n    }\n  }];\n}\n\n// Build context string\nconst context = searchResults\n  .map((r, i) => `[${i + 1}] From \"${r.document_name}\":\\n${r.content}`)\n  .join('\\n\\n---\\n\\n');\n\n// Build sources array\nconst sources = searchResults.map((r, i) => ({\n  index: i + 1,\n  documentName: r.document_name,\n  documentId: r.document_id,\n  similarity: parseFloat(r.similarity).toFixed(3),\n  preview: r.content.substring(0, 150) + (r.content.length > 150 ? '...' : '')\n}));\n\nreturn [{\n  json: {\n    question: questionData.question,\n    hasResults: true,\n    context,\n    sources,\n    chunksRetrieved: searchResults.length,\n    startTime: questionData.startTime\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1200, 300],
+      "id": "code-format-context",
+      "name": "Format Context"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "has-results",
+              "leftValue": "={{ $json.hasResults }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1400, 300],
+      "id": "if-has-results",
+      "name": "Has Results?"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"gpt-4o\",\n  \"messages\": [\n    {\n      \"role\": \"system\",\n      \"content\": \"You are a concise AI assistant that answers questions based on the provided context. Keep answers brief - 2-3 sentences maximum unless the question requires detail. Cite sources using [1], [2], etc. If the context doesn't answer the question, say so in one sentence.\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": {{ JSON.stringify(\"Context from documents:\\n\\n\" + $json.context + \"\\n\\n---\\n\\nQuestion: \" + $json.question + \"\\n\\nAnswer briefly (2-3 sentences) based on the context above. Cite sources using [1], [2], etc.\") }}\n    }\n  ],\n  \"temperature\": 0.3,\n  \"max_tokens\": 150\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1600, 200],
+      "id": "http-chat",
+      "name": "GPT-4o Response",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "7qAmD2SPJNRp6TZm",
+          "name": "OpenAI API Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Format final response\nconst contextData = $('Format Context').first().json;\nconst chatResponse = $input.first().json;\n\nconst answer = chatResponse.choices[0].message.content;\nconst totalTime = Date.now() - contextData.startTime;\n\nreturn [{\n  json: {\n    response: answer,\n    sources: contextData.sources,\n    metadata: {\n      chunksRetrieved: contextData.chunksRetrieved,\n      totalTimeMs: totalTime\n    }\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1800, 200],
+      "id": "code-format-response",
+      "name": "Format Response"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [2000, 200],
+      "id": "respond-answer",
+      "name": "Respond with Answer"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\n  \"response\": \"I don't have enough information to answer that question. Please upload documents first.\",\n  \"sources\": [],\n  \"metadata\": {\n    \"chunksRetrieved\": 0,\n    \"totalTimeMs\": {{ Date.now() - $json.startTime }}\n  }\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1600, 400],
+      "id": "respond-no-results",
+      "name": "Respond No Results"
+    }
+  ],
+  "connections": {
+    "Webhook - Query": {
+      "main": [
+        [
+          {
+            "node": "Validate Question",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Question": {
+      "main": [
+        [
+          {
+            "node": "Embed Question",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Embed Question": {
+      "main": [
+        [
+          {
+            "node": "Prepare Search",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Search": {
+      "main": [
+        [
+          {
+            "node": "Vector Search",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Vector Search": {
+      "main": [
+        [
+          {
+            "node": "Format Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Context": {
+      "main": [
+        [
+          {
+            "node": "Has Results?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Results?": {
+      "main": [
+        [
+          {
+            "node": "GPT-4o Response",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond No Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GPT-4o Response": {
+      "main": [
+        [
+          {
+            "node": "Format Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Response": {
+      "main": [
+        [
+          {
+            "node": "Respond with Answer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "meta": {
+    "instanceId": "n8n-rag-chatbot"
+  },
+  "tags": []
+}
