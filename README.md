@@ -1,6 +1,17 @@
 # n8n RAG Chatbot
 
-RAG (Retrieval-Augmented Generation) chatbot built in n8n workflows, using the same Neon database as the Tier S portfolio project.
+RAG (Retrieval-Augmented Generation) chatbot powered by n8n workflows, pgvector, and OpenAI.
+
+**Live Demo:** [n8n-rag.cameronobrien.dev](https://n8n-rag.cameronobrien.dev)
+
+## Features
+
+- Purple glassmorphism UI (same styling as portfolio)
+- Document upload and chunking via n8n workflow
+- Vector similarity search with pgvector
+- GPT-4o responses with source citations
+- Session-based privacy (localStorage)
+- No backend API - frontend calls n8n webhooks directly
 
 ## Workflows
 
@@ -72,6 +83,19 @@ curl -X POST http://localhost:5678/webhook/rag-query \
   }'
 ```
 
+## Frontend
+
+Next.js 15 app with:
+- Tailwind CSS + custom glassmorphism theme
+- Direct webhook calls to n8n (no backend API)
+- ChatInterface component for upload/query
+- Session privacy via localStorage
+
+```bash
+npm install
+npm run dev
+```
+
 ## Architecture
 
 Uses same database schema as the Tier S rag-chatbot:
@@ -83,4 +107,4 @@ Chunking: 500 tokens, 50 overlap, sentence boundaries.
 
 ---
 
-Built by Cameron O'Brien
+Built by Cameron O'Brien | [cameronobrien.dev](https://cameronobrien.dev)
