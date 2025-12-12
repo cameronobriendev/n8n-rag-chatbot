@@ -187,7 +187,7 @@ export default function ChatInterface() {
             </p>
           </div>
           <label className={`glass-button px-4 py-2 rounded-lg transition-colors ${!sessionId || uploading ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}`}>
-            {uploading ? 'Uploading...' : 'Upload File'}
+            {uploading ? 'Uploading...' : 'Upload .txt File'}
             <input
               type="file"
               accept=".txt"
